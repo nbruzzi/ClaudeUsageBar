@@ -132,7 +132,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
             statusManager: statusManager,
-            updateManager: updateManager
+            updateManager: updateManager,
+            onHeightChange: { [weak self] height in
+                // Explicitly re-set contentSize (rather than relying only on
+                // NSHostingController's implicit resize propagation) so
+                // AppKit re-runs its own screen-bounds-aware repositioning
+                // whenever the SwiftUI content's measured height changes
+                // after the popover is already showing. Without this, a
+                // status-bar-anchored popover (already pinned near the very
+                // top of the screen, with almost no room above it) can grow
+                // upward past the top edge when its content jumps from the
+                // small initial-guess height to the real, taller height once
+                // usage/status data has rendered.
+                self?.popover.contentSize = NSSize(width: 360, height: height)
+            }
         ))
 
         // Fetch initial data
@@ -424,6 +437,14 @@ class UsageManager: ObservableObject {
     private var sessionCookie: String = ""
     private weak var delegate: AppDelegate?
     private var lastNotifiedThreshold: Int = 0
+
+    // Truncated preview for the settings UI. Exposed instead of letting the
+    // view read UserDefaults directly -- the cookie now lives in Keychain
+    // (loadSessionCookie), so a raw UserDefaults read here would only ever
+    // see it briefly during the one-time legacy migration, then go stale.
+    var sessionCookiePreview: String? {
+        sessionCookie.isEmpty ? nil : String(sessionCookie.prefix(20)) + "..."
+    }
 
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
         self.statusItem = statusItem
@@ -1358,6 +1379,7 @@ struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
+    var onHeightChange: (CGFloat) -> Void = { _ in }
     @State private var sessionCookieInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
@@ -1381,10 +1403,11 @@ struct UsageView: View {
             .onPreferenceChange(ContentHeightKey.self) { value in
                 guard value > 0 else { return }
                 measuredHeight = value
+                onHeightChange(min(max(value, 100), maxPopupHeight))
             }
             .onAppear {
-                if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                    sessionCookieInput = String(savedCookie.prefix(20)) + "..."
+                if let preview = usageManager.sessionCookiePreview {
+                    sessionCookieInput = preview
                 }
                 usageManager.updatePercentages()
             }
