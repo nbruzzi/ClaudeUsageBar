@@ -68,21 +68,51 @@ find "$APP_PATH" -name '._*' -delete 2>/dev/null
 find "$APP_PATH" -name '.DS_Store' -delete 2>/dev/null
 dot_clean "$APP_PATH" 2>/dev/null
 
-# Sign with Developer ID certificate. NEVER silently fall back to ad-hoc — that
-# fails notarization later. If real signing fails, error out loudly.
-DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
-if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH"; then
-    echo "✅ App signed with Developer ID"
-    if codesign --verify --verbose=2 "$APP_PATH" 2>&1 | grep -q "valid on disk"; then
-        echo "✅ Signature verified"
+# Sign with a Developer ID certificate when one is actually available, so
+# the build stays notarizable. CODESIGN_IDENTITY lets you point at your own
+# cert instead of the upstream maintainer's (you won't have theirs unless
+# you are them). If neither is present in the keychain, fall back to ad-hoc
+# signing so a local clone is still runnable — loudly, since that build
+# can't be notarized and Gatekeeper will flag it on first launch. An
+# EXPLICITLY requested CODESIGN_IDENTITY that fails still errors out loudly
+# rather than silently falling back — that's a real config problem, not the
+# expected "I don't have the upstream cert" gap this fallback exists for.
+UPSTREAM_DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
+DEVELOPER_ID="${CODESIGN_IDENTITY:-$UPSTREAM_DEVELOPER_ID}"
+IDENTITY_OVERRIDDEN="${CODESIGN_IDENTITY:+1}"
+
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$DEVELOPER_ID"; then
+    if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH"; then
+        echo "✅ App signed with Developer ID"
+        if codesign --verify --verbose=2 "$APP_PATH" 2>&1 | grep -q "valid on disk"; then
+            echo "✅ Signature verified"
+        else
+            echo "❌ Signature verification failed — fix before shipping" >&2
+            exit 1
+        fi
     else
-        echo "❌ Signature verification failed — fix before shipping" >&2
+        echo "❌ Developer ID signing failed even though the identity is in your keychain." >&2
+        echo "   Fix the cause above (often: stale xattrs / ._files) and re-run." >&2
         exit 1
     fi
-else
-    echo "❌ Developer ID signing failed. NOT falling back to ad-hoc (would break notarization)." >&2
-    echo "   Fix the cause above (often: stale xattrs / ._files / cert not in keychain) and re-run." >&2
+elif [ -n "$IDENTITY_OVERRIDDEN" ]; then
+    echo "❌ CODESIGN_IDENTITY=\"$DEVELOPER_ID\" is not in your keychain." >&2
+    echo "   Run 'security find-identity -v -p codesigning' to see what's available." >&2
     exit 1
+else
+    echo "⚠️  \"$UPSTREAM_DEVELOPER_ID\" is not in your keychain — that's the upstream" >&2
+    echo "   maintainer's cert, expected unless you are them." >&2
+    echo "   Falling back to ad-hoc signing so the build is runnable locally." >&2
+    echo "   This build is NOT notarizable; on first launch, right-click the app ->" >&2
+    echo "   Open (instead of double-clicking) to get past Gatekeeper's warning." >&2
+    echo "   To sign with your own Developer ID instead: set CODESIGN_IDENTITY to an" >&2
+    echo "   identity from 'security find-identity -v -p codesigning' and re-run." >&2
+    if codesign --force --deep --options runtime --sign - "$APP_PATH"; then
+        echo "✅ App ad-hoc signed"
+    else
+        echo "❌ Even ad-hoc signing failed — something is wrong beyond a missing cert." >&2
+        exit 1
+    fi
 fi
 
 echo "Build successful!"
