@@ -309,6 +309,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.usageManager.updatePercentages()
             }
 
+            // Accessory apps (LSUIElement -- no Dock icon) aren't made the
+            // active/key app just by showing a popover. Without this, the
+            // popover's window isn't key on first appearance, so AppKit
+            // renders controls (ProgressView especially) in their inactive/
+            // unfocused tint -- greyed out with no color -- until the user
+            // clicks somewhere inside it, which is what finally makes the
+            // window key and triggers the switch to the active appearance.
+            // Activating explicitly makes it render correctly from open.
+            NSApp.activate(ignoringOtherApps: true)
+
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
             // Add event monitor to detect clicks outside the popover
