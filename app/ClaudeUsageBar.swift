@@ -1406,9 +1406,13 @@ struct UsageView: View {
                 onHeightChange(min(max(value, 100), maxPopupHeight))
             }
             .onAppear {
-                if let preview = usageManager.sessionCookiePreview {
-                    sessionCookieInput = preview
-                }
+                // Deliberately do NOT pre-fill sessionCookieInput here -- it's
+                // the same @State bound to the paste field AND wired straight
+                // to "Save Cookie & Fetch". Pre-filling it with a truncated
+                // preview meant clicking Save without re-pasting would
+                // silently overwrite a valid Keychain cookie with a garbage
+                // fragment, logging the user out with no automatic recovery.
+                // The preview renders as read-only text instead (below).
                 usageManager.updatePercentages()
             }
             .onChange(of: showingSettings) { isOpen in
@@ -1698,6 +1702,17 @@ struct UsageView: View {
             }
             .buttonStyle(.borderless)
             .font(.caption)
+
+            // Read-only display of what's already saved, kept deliberately
+            // separate from the editable paste field below -- pre-filling
+            // that field with this preview previously let "Save Cookie &
+            // Fetch" silently overwrite a valid cookie with the truncated
+            // display text if clicked without pasting a new value first.
+            if let preview = usageManager.sessionCookiePreview {
+                Text("Currently saved: \(preview)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
 
             if showingCookieInput {
                 VStack(alignment: .leading, spacing: 8) {
