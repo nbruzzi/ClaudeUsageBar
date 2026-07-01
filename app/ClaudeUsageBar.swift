@@ -29,7 +29,15 @@ enum KeychainHelper {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: data,
-            kSecUseDataProtectionKeychain as String: true,
+            // NOTE: deliberately NOT kSecUseDataProtectionKeychain — that
+            // namespace requires a keychain-access-groups entitlement this
+            // app doesn't carry (no --entitlements in build.sh's codesign
+            // call), and load()/delete() below don't opt into it either.
+            // Setting it only here would write to a keychain the read path
+            // can never see, either failing outright (no entitlement) or
+            // silently losing the value on next load — caught empirically
+            // via the round-trip check below, not asserted from a comment.
+            //
             // Available once the device has been unlocked after boot, and
             // explicitly does NOT migrate to a new device (Migration
             // Assistant / encrypted backup restore) — appropriate for a
@@ -41,8 +49,20 @@ enum KeychainHelper {
         let status = SecItemAdd(query as CFDictionary, nil)
         if status != errSecSuccess {
             NSLog("ClaudeUsage: Keychain save failed, status: \(status)")
+            return false
         }
-        return status == errSecSuccess
+
+        // A non-error status alone isn't proof the value is durably
+        // retrievable — verify by reading it straight back through the same
+        // path load() uses. Catches a query-option mismatch between save and
+        // load (e.g. a save that lands in a keychain namespace the read path
+        // doesn't target) instead of letting it degrade silently to
+        // re-paste-every-launch.
+        guard load(account: account) == value else {
+            NSLog("ClaudeUsage: Keychain save reported success but read-back verification failed")
+            return false
+        }
+        return true
     }
 
     static func load(account: String) -> String? {
