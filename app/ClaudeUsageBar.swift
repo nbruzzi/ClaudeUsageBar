@@ -304,6 +304,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func openPopover() {
         if let button = statusItem.button {
+            // Defensive: the only current caller (togglePopover) guards on
+            // popover.isShown before calling this, so this path is not
+            // reachable today -- but that guard lives in the caller, not
+            // here. If openPopover is ever entered while a monitor from a
+            // prior open is still installed, remove it first rather than
+            // leaking a duplicate global event monitor.
+            if let existingMonitor = eventMonitor {
+                NSEvent.removeMonitor(existingMonitor)
+                eventMonitor = nil
+            }
+
             // Force UI refresh by updating percentages
             DispatchQueue.main.async {
                 self.usageManager.updatePercentages()
