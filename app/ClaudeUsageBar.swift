@@ -434,7 +434,16 @@ class UsageManager: ObservableObject {
     @Published var shortcutEnabled: Bool = true
 
     private var statusItem: NSStatusItem?
-    private var sessionCookie: String = ""
+    // didSet (not a plain computed sessionCookiePreview) so the published
+    // preview's freshness is structural: ANY future assignment to
+    // sessionCookie -- from this file or a later edit -- keeps the UI in
+    // sync automatically, rather than depending on every call site
+    // remembering to also touch some other @Published property in the same
+    // render cycle (that's how the label happened to stay correct before,
+    // by accident of what else each caller published alongside it).
+    private var sessionCookie: String = "" {
+        didSet { sessionCookiePreview = Self.preview(for: sessionCookie) }
+    }
     private weak var delegate: AppDelegate?
     private var lastNotifiedThreshold: Int = 0
 
@@ -442,8 +451,10 @@ class UsageManager: ObservableObject {
     // view read UserDefaults directly -- the cookie now lives in Keychain
     // (loadSessionCookie), so a raw UserDefaults read here would only ever
     // see it briefly during the one-time legacy migration, then go stale.
-    var sessionCookiePreview: String? {
-        sessionCookie.isEmpty ? nil : String(sessionCookie.prefix(20)) + "..."
+    @Published private(set) var sessionCookiePreview: String?
+
+    private static func preview(for cookie: String) -> String? {
+        cookie.isEmpty ? nil : String(cookie.prefix(20)) + "..."
     }
 
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
@@ -529,17 +540,23 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.synchronize()
     }
 
-    func saveSessionCookie(_ cookie: String) {
+    /// Returns whether the cookie was durably persisted to Keychain (vs. only
+    /// held in memory for this app run) -- callers must surface a failure
+    /// here to the user, not just to NSLog, or "Cookie saved" silently lies.
+    @discardableResult
+    func saveSessionCookie(_ cookie: String) -> Bool {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
         sessionCookie = cookie
         // A new cookie may belong to a different account than whatever org
         // ID was cached for the previous one.
         cachedOrgId = nil
-        if KeychainHelper.save(cookie, account: Self.cookieKeychainAccount) {
+        let persisted = KeychainHelper.save(cookie, account: Self.cookieKeychainAccount)
+        if persisted {
             NSLog("ClaudeUsage: Cookie saved successfully")
         } else {
             NSLog("ClaudeUsage: Cookie save to Keychain failed — cookie will only last for this app run")
         }
+        return persisted
     }
 
     func clearSessionCookie() {
@@ -1757,9 +1774,11 @@ struct UsageView: View {
                                     if sessionCookieInput.isEmpty {
                                         usageManager.errorMessage = "Cookie field is empty!"
                                     } else {
-                                        usageManager.saveSessionCookie(sessionCookieInput)
+                                        let persisted = usageManager.saveSessionCookie(sessionCookieInput)
                                         usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
+                                        usageManager.errorMessage = persisted
+                                            ? "Cookie saved, fetching..."
+                                            : "Keychain write failed — cookie works for this run only, will need re-entry next launch"
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
