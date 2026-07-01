@@ -1,7 +1,65 @@
 import SwiftUI
 import AppKit
-import WebKit
 import Carbon
+import Security
+
+// MARK: - Keychain-backed secret storage
+//
+// The session cookie is a full bearer credential for the user's claude.ai
+// account (not a scoped API key), so it belongs in Keychain rather than
+// UserDefaults (which persists as a plaintext preferences plist readable by
+// anything running as the same local user). Minimal wrapper over the
+// Security framework's generic-password API, scoped to this app's bundle ID.
+enum KeychainHelper {
+    private static let service = "com.claude.usagebar"
+
+    static func save(_ value: String, account: String) {
+        guard let data = value.data(using: .utf8) else { return }
+
+        // Remove any existing item first — SecItemAdd fails on a duplicate.
+        delete(account: account)
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: data,
+            // Available as soon as the device is unlocked once after boot;
+            // doesn't sync to iCloud Keychain or survive a device migration —
+            // appropriate for a locally-scoped session cookie.
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        ]
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        if status != errSecSuccess {
+            NSLog("ClaudeUsage: Keychain save failed, status: \(status)")
+        }
+    }
+
+    static func load(account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func delete(account: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
 
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -350,9 +408,25 @@ class UsageManager: ObservableObject {
         isAccessibilityEnabled = AXIsProcessTrusted()
     }
 
+    private static let cookieKeychainAccount = "claude_session_cookie"
+    // Legacy UserDefaults key — read once for migration, never written again.
+    private static let legacyCookieDefaultsKey = "claude_session_cookie"
+
     func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-            sessionCookie = savedCookie
+        if let keychainCookie = KeychainHelper.load(account: Self.cookieKeychainAccount) {
+            sessionCookie = keychainCookie
+            return
+        }
+
+        // One-time migration: an existing install may still have the cookie
+        // in UserDefaults from before this was Keychain-backed. Move it over
+        // so users don't have to re-paste a cookie that's already saved.
+        if let legacyCookie = UserDefaults.standard.string(forKey: Self.legacyCookieDefaultsKey) {
+            NSLog("ClaudeUsage: Migrating cookie from UserDefaults to Keychain")
+            KeychainHelper.save(legacyCookie, account: Self.cookieKeychainAccount)
+            UserDefaults.standard.removeObject(forKey: Self.legacyCookieDefaultsKey)
+            UserDefaults.standard.synchronize()
+            sessionCookie = legacyCookie
         }
     }
 
@@ -401,16 +475,14 @@ class UsageManager: ObservableObject {
     func saveSessionCookie(_ cookie: String) {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
         sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
+        KeychainHelper.save(cookie, account: Self.cookieKeychainAccount)
         NSLog("ClaudeUsage: Cookie saved successfully")
     }
 
     func clearSessionCookie() {
         NSLog("ClaudeUsage: Clearing cookie")
         sessionCookie = ""
-        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
+        KeychainHelper.delete(account: Self.cookieKeychainAccount)
 
         // Reset all data
         sessionUsage = 0
@@ -425,10 +497,27 @@ class UsageManager: ObservableObject {
         lastNotifiedThreshold = 0
         UserDefaults.standard.set(0, forKey: "last_notified_threshold")
 
+        // Cached org ID may not apply to whatever cookie gets set next.
+        cachedOrgId = nil
+
         // Update status bar to show 0%
         delegate?.updateStatusIcon(percentage: 0)
 
         NSLog("ClaudeUsage: Cookie cleared, data reset")
+    }
+
+    // Non-sensitive (just an org identifier, not a credential) — UserDefaults is fine here.
+    private static let cachedOrgIdDefaultsKey = "cached_org_id"
+
+    private var cachedOrgId: String? {
+        get { UserDefaults.standard.string(forKey: Self.cachedOrgIdDefaultsKey) }
+        set {
+            if let newValue = newValue {
+                UserDefaults.standard.set(newValue, forKey: Self.cachedOrgIdDefaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.cachedOrgIdDefaultsKey)
+            }
+        }
     }
 
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
@@ -482,6 +571,14 @@ class UsageManager: ObservableObject {
         isLoading = true
         errorMessage = nil
 
+        // Reuse a previously-resolved org ID to skip the bootstrap round-trip
+        // on every poll. fetchUsageWithOrgId re-resolves once if the cached
+        // ID turns out to be stale (e.g. the user switched Anthropic orgs).
+        if let orgId = cachedOrgId {
+            fetchUsageWithOrgId(orgId, allowOrgRetry: true)
+            return
+        }
+
         // Extract org ID from cookie
         fetchOrganizationId { [weak self] orgId in
             guard let self = self, let orgId = orgId else {
@@ -492,11 +589,12 @@ class UsageManager: ObservableObject {
                 return
             }
 
-            self.fetchUsageWithOrgId(orgId)
+            self.cachedOrgId = orgId
+            self.fetchUsageWithOrgId(orgId, allowOrgRetry: false)
         }
     }
 
-    func fetchUsageWithOrgId(_ orgId: String) {
+    func fetchUsageWithOrgId(_ orgId: String, allowOrgRetry: Bool) {
         let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
 
         guard let url = URL(string: urlString) else {
@@ -523,34 +621,61 @@ class UsageManager: ObservableObject {
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
-                self?.isLoading = false
+                guard let self = self else { return }
+                self.isLoading = false
 
                 if let error = error {
                     NSLog("❌ Error: \(error.localizedDescription)")
-                    self?.errorMessage = "Network error"
-                    self?.updateStatusBar()
+                    self.errorMessage = "Network error"
+                    self.updateStatusBar()
                     return
                 }
 
                 guard let httpResponse = response as? HTTPURLResponse else {
-                    self?.errorMessage = "Invalid response"
-                    self?.updateStatusBar()
+                    self.errorMessage = "Invalid response"
+                    self.updateStatusBar()
                     return
                 }
 
                 NSLog("📡 Status: \(httpResponse.statusCode)")
 
+                #if DEBUG
+                // Full response body is only logged in debug builds — it's
+                // account usage data, not something that belongs in a
+                // release build's system log.
                 if let data = data, let responseString = String(data: data, encoding: .utf8) {
                     NSLog("📦 Response: \(responseString)")
                 }
+                #endif
 
                 if httpResponse.statusCode == 200, let data = data {
-                    self?.parseUsageData(data)
+                    self.parseUsageData(data)
+                } else if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                    if allowOrgRetry {
+                        // Cached org ID may be stale (e.g. org switch) —
+                        // clear it and resolve fresh once before giving up.
+                        NSLog("⚠️ Cached org ID rejected (\(httpResponse.statusCode)); re-resolving")
+                        self.cachedOrgId = nil
+                        self.fetchOrganizationId { [weak self] newOrgId in
+                            DispatchQueue.main.async {
+                                guard let self = self else { return }
+                                guard let newOrgId = newOrgId else {
+                                    self.errorMessage = "Session expired — please paste a fresh cookie"
+                                    self.updateStatusBar()
+                                    return
+                                }
+                                self.cachedOrgId = newOrgId
+                                self.fetchUsageWithOrgId(newOrgId, allowOrgRetry: false)
+                            }
+                        }
+                        return
+                    }
+                    self.errorMessage = "Session expired — please paste a fresh cookie"
                 } else {
-                    self?.errorMessage = "HTTP \(httpResponse.statusCode)"
+                    self.errorMessage = "HTTP \(httpResponse.statusCode)"
                 }
 
-                self?.updateStatusBar()
+                self.updateStatusBar()
             }
         }.resume()
     }
