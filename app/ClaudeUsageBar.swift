@@ -13,8 +13,13 @@ import Security
 enum KeychainHelper {
     private static let service = "com.claude.usagebar"
 
-    static func save(_ value: String, account: String) {
-        guard let data = value.data(using: .utf8) else { return }
+    /// Returns whether the write actually succeeded — callers that use this
+    /// to migrate off (and delete) another store must not treat a silent
+    /// failure here as success, or the value is lost with no copy left
+    /// anywhere.
+    @discardableResult
+    static func save(_ value: String, account: String) -> Bool {
+        guard let data = value.data(using: .utf8) else { return false }
 
         // Remove any existing item first — SecItemAdd fails on a duplicate.
         delete(account: account)
@@ -24,16 +29,20 @@ enum KeychainHelper {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: data,
-            // Available as soon as the device is unlocked once after boot;
-            // doesn't sync to iCloud Keychain or survive a device migration —
-            // appropriate for a locally-scoped session cookie.
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+            kSecUseDataProtectionKeychain as String: true,
+            // Available once the device has been unlocked after boot, and
+            // explicitly does NOT migrate to a new device (Migration
+            // Assistant / encrypted backup restore) — appropriate for a
+            // locally-scoped session cookie that shouldn't silently follow
+            // the user to another machine.
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
 
         let status = SecItemAdd(query as CFDictionary, nil)
         if status != errSecSuccess {
             NSLog("ClaudeUsage: Keychain save failed, status: \(status)")
         }
+        return status == errSecSuccess
     }
 
     static func load(account: String) -> String? {
@@ -421,12 +430,19 @@ class UsageManager: ObservableObject {
         // One-time migration: an existing install may still have the cookie
         // in UserDefaults from before this was Keychain-backed. Move it over
         // so users don't have to re-paste a cookie that's already saved.
+        // Only delete the UserDefaults copy once the Keychain write actually
+        // succeeds — otherwise a Keychain error would silently lose the
+        // cookie entirely (destroyed here, never persisted there).
         if let legacyCookie = UserDefaults.standard.string(forKey: Self.legacyCookieDefaultsKey) {
             NSLog("ClaudeUsage: Migrating cookie from UserDefaults to Keychain")
-            KeychainHelper.save(legacyCookie, account: Self.cookieKeychainAccount)
-            UserDefaults.standard.removeObject(forKey: Self.legacyCookieDefaultsKey)
-            UserDefaults.standard.synchronize()
             sessionCookie = legacyCookie
+            if KeychainHelper.save(legacyCookie, account: Self.cookieKeychainAccount) {
+                UserDefaults.standard.removeObject(forKey: Self.legacyCookieDefaultsKey)
+                UserDefaults.standard.synchronize()
+                NSLog("ClaudeUsage: Migration to Keychain succeeded")
+            } else {
+                NSLog("ClaudeUsage: Migration to Keychain failed — leaving cookie in legacy storage for retry next launch")
+            }
         }
     }
 
@@ -475,8 +491,14 @@ class UsageManager: ObservableObject {
     func saveSessionCookie(_ cookie: String) {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
         sessionCookie = cookie
-        KeychainHelper.save(cookie, account: Self.cookieKeychainAccount)
-        NSLog("ClaudeUsage: Cookie saved successfully")
+        // A new cookie may belong to a different account than whatever org
+        // ID was cached for the previous one.
+        cachedOrgId = nil
+        if KeychainHelper.save(cookie, account: Self.cookieKeychainAccount) {
+            NSLog("ClaudeUsage: Cookie saved successfully")
+        } else {
+            NSLog("ClaudeUsage: Cookie save to Keychain failed — cookie will only last for this app run")
+        }
     }
 
     func clearSessionCookie() {
@@ -506,19 +528,13 @@ class UsageManager: ObservableObject {
         NSLog("ClaudeUsage: Cookie cleared, data reset")
     }
 
-    // Non-sensitive (just an org identifier, not a credential) — UserDefaults is fine here.
-    private static let cachedOrgIdDefaultsKey = "cached_org_id"
-
-    private var cachedOrgId: String? {
-        get { UserDefaults.standard.string(forKey: Self.cachedOrgIdDefaultsKey) }
-        set {
-            if let newValue = newValue {
-                UserDefaults.standard.set(newValue, forKey: Self.cachedOrgIdDefaultsKey)
-            } else {
-                UserDefaults.standard.removeObject(forKey: Self.cachedOrgIdDefaultsKey)
-            }
-        }
-    }
+    // In-memory only, deliberately not persisted: a value here steers which
+    // URL the Keychain-protected cookie gets sent to
+    // (claude.ai/api/organizations/{orgId}/usage), so it must not sit in a
+    // store any other local process could write to. Living only in this
+    // running instance also means it can't go stale across a cookie swap
+    // for a different account in a way that outlives the process.
+    private var cachedOrgId: String?
 
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
         // Get org ID from the lastActiveOrg cookie value
