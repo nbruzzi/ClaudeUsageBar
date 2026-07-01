@@ -107,6 +107,10 @@ else
     echo "   Open (instead of double-clicking) to get past Gatekeeper's warning." >&2
     echo "   To sign with your own Developer ID instead: set CODESIGN_IDENTITY to an" >&2
     echo "   identity from 'security find-identity -v -p codesigning' and re-run." >&2
+    echo "   Note: ad-hoc signatures aren't stable across rebuilds, so each rebuild" >&2
+    echo "   may trigger a one-time Keychain access prompt for the saved cookie." >&2
+    echo "   If access is denied and re-pasting the cookie doesn't stick, clear the" >&2
+    echo "   stale item first: security delete-generic-password -s com.claude.usagebar" >&2
     if codesign --force --deep --options runtime --sign - "$APP_PATH"; then
         echo "✅ App ad-hoc signed"
     else
